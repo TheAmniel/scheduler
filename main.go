@@ -1,5 +1,8 @@
 package main
 
+import "github.com/theamniel/scheduler/ipc"
+
 func main() {
-	print("Hello, world!")
+	process := ipc.New()
+	process.Start()
 }
