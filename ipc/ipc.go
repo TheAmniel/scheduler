@@ -10,6 +10,9 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/theamniel/scheduler/types"
+	"gorm.io/gorm"
 )
 
 type IPC struct {
@@ -17,6 +20,7 @@ type IPC struct {
 	Send    chan *Message
 	Message chan *Message
 	Done    chan bool
+	DB      *gorm.DB
 }
 
 func New() *IPC {
@@ -27,12 +31,75 @@ func New() *IPC {
 	}
 }
 
+func (ipc *IPC) SetDatabase(db *gorm.DB) {
+	ipc.Lock()
+	ipc.DB = db
+	ipc.Unlock()
+}
+
+func (ipc *IPC) HasDatabase() bool {
+	ipc.RLock()
+	defer ipc.RUnlock()
+	return ipc.DB != nil
+}
+
+func (ipc *IPC) ToSchedule(payload any) *types.Schedule {
+	item := payload.(map[string]any)
+	s := &types.Schedule{
+		ID:        item["id"].(string),
+		CreatedAt: int64(item["created_at"].(float64)),
+		ExpiresAt: int64(item["expires_at"].(float64)),
+	}
+	if item["content"] != nil {
+		s.Content = item["content"].(string)
+	}
+	return s
+}
+
+func (ipc *IPC) Schedule(s *types.Schedule) {
+	if ipc.HasDatabase() {
+		if err := ipc.DB.Where("id = ?", s.ID).Select("id").First(&types.Schedule{}).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				if err = ipc.DB.Create(s).Error; err != nil {
+					log.Printf("Unable to create schedule: %v\n", err)
+					return
+				}
+			} else {
+				log.Printf("Unable to find or create schedule: %v\n", err)
+				return
+			}
+		}
+
+		go func() {
+			select {
+			case <-time.After(time.Duration(s.ExpiresAt-s.CreatedAt) * time.Millisecond):
+				if rs := ipc.DB.Select("id").Where("id = ?", s.ID).Find(&types.Schedule{}).RowsAffected; rs > 0 {
+					if err := ipc.DB.Unscoped().Delete(&s).Error; err != nil {
+						log.Printf("Unable to delete schedule from db: %v\n", err)
+					}
+					ipc.Send <- &Message{"schedule:done", s}
+				}
+			}
+		}()
+	}
+}
+
 func (ipc *IPC) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	go ipc.reader(ctx)
 	go ipc.writer(ctx)
 	go ipc.watch(ctx)
-	ipc.Send <- &Message{Op: IpcReady}
+
+	var pendings []*types.Schedule
+	if err := ipc.DB.Where("status = \"Active\"").Find(&pendings).Error; err != nil {
+		log.Println(err)
+	} else {
+		for _, sch := range pendings {
+			ipc.Schedule(sch)
+		}
+	}
+
+	ipc.Send <- &Message{Event: "ready"}
 	<-ipc.Done
 	cancel()
 }
@@ -47,15 +114,31 @@ func (ipc *IPC) watch(c context.Context) {
 		select {
 		case data, ok := <-ipc.Message:
 			if ok {
-				if data.Op == IpcDispatch {
-					// handle data.T and data.D.....
-					ipc.Send <- &Message{IpcDispatch, "TEST_EVENT", nil}
-				} else if data.Op == IpcExit {
+				switch data.Event {
+				case "schedule:add":
+					{
+						ipc.Schedule(ipc.ToSchedule(data.Data))
+						ipc.Send <- &Message{"schedule:added", true}
+					}
+				case "schedule:exists":
+					{
+						rs := ipc.DB.Select("id").Where("id = ?", data.Data.(string)).Find(&types.Schedule{}).RowsAffected
+						ipc.Send <- &Message{"schedule:exists", rs > 0}
+					}
+				case "schedule:delete":
+					{
+						err := ipc.DB.Unscoped().Where("id = ?", data.Data.(string)).Delete(&types.Schedule{}).Error
+						if err != nil {
+							log.Printf("Unable to delete schedule: %v\n", err)
+							continue
+						}
+						ipc.Send <- &Message{"schedule:delete", true}
+					}
+				case "exit":
 					ipc.Close()
 					return
-				} else {
-					log.Println("Invalid Opcode.")
-					continue
+				default:
+					log.Println("Unknown event")
 				}
 			} else {
 				ipc.Close()
@@ -73,7 +156,9 @@ func (ipc *IPC) writer(c context.Context) {
 		select {
 		case msg, ok := <-ipc.Send:
 			if ok {
+				ipc.RLock()
 				data, err := MarshalJSON(msg)
+				ipc.RLock()
 				if err != nil {
 					log.Println(err)
 				} else {
@@ -94,7 +179,9 @@ func (ipc *IPC) reader(c context.Context) {
 	for {
 		select {
 		case <-time.Tick(10 * time.Millisecond):
+			ipc.RLock()
 			data, err := input.ReadBytes('\n')
+			ipc.RUnlock()
 			if err != nil {
 				log.Println(err)
 				continue

@@ -7,6 +7,7 @@ logs
 **/*.db
 **/*.exe
 **/*.ps*1
+**/*.js
 
 # Editor directories and files
 .vscode/*
