@@ -15,6 +15,8 @@ import (
 	"gorm.io/gorm"
 )
 
+// TODO: all action in db move to background
+
 type IPC struct {
 	sync.RWMutex
 	Send    chan *Message
@@ -53,8 +55,8 @@ func (ipc *IPC) ToSchedule(payload any) *types.Schedule {
 	item := payload.(map[string]any)
 	s := &types.Schedule{
 		ID:        item["id"].(string),
-		CreatedAt: int64(item["created_at"].(float64)),
-		ExpiresAt: int64(item["expires_at"].(float64)),
+		CreatedAt: time.Duration(time.Now().Unix() * 1000),
+		ExpiresAt: time.Duration(time.Now().Unix()*1000) + (time.Duration(item["expires_at"].(float64)) * time.Microsecond) - 50,
 	}
 	if item["content"] != nil {
 		s.Content = item["content"].(string)
@@ -82,10 +84,10 @@ func (ipc *IPC) Schedule(s *types.Schedule) {
 
 func (ipc *IPC) WatchSchedule(s *types.Schedule) {
 	select {
-	case <-time.After(time.Duration(s.ExpiresAt-s.CreatedAt) * time.Millisecond):
+	case <-time.After((s.ExpiresAt - time.Duration(time.Now().Unix()*1000)) * time.Millisecond):
 		db := ipc.GetDatabase()
-		if rs := db.Select("id").Where("id = ?", s.ID).Find(&types.Schedule{}).RowsAffected; rs > 0 {
-			if err := db.Unscoped().Delete(&s).Error; err != nil {
+		if rs := db.Select("id").Find(s).RowsAffected; rs > 0 {
+			if err := db.Unscoped().Delete(s).Error; err != nil {
 				log.Printf("Unable to delete schedule from db: %v\n", err)
 			}
 			ipc.Send <- &Message{"schedule:done", s}
