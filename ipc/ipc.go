@@ -20,7 +20,7 @@ type IPC struct {
 	Send    chan *Message
 	Message chan *Message
 	Done    chan bool
-	DB      *gorm.DB
+	db      *gorm.DB
 }
 
 func New() *IPC {
@@ -31,16 +31,22 @@ func New() *IPC {
 	}
 }
 
+func (ipc *IPC) GetDatabase() *gorm.DB {
+	ipc.RLock()
+	defer ipc.RUnlock()
+	return ipc.db
+}
+
 func (ipc *IPC) SetDatabase(db *gorm.DB) {
 	ipc.Lock()
-	ipc.DB = db
+	ipc.db = db
 	ipc.Unlock()
 }
 
 func (ipc *IPC) HasDatabase() bool {
 	ipc.RLock()
 	defer ipc.RUnlock()
-	return ipc.DB != nil
+	return ipc.db != nil
 }
 
 func (ipc *IPC) ToSchedule(payload any) *types.Schedule {
@@ -58,9 +64,10 @@ func (ipc *IPC) ToSchedule(payload any) *types.Schedule {
 
 func (ipc *IPC) Schedule(s *types.Schedule) {
 	if ipc.HasDatabase() {
-		if err := ipc.DB.Where("id = ?", s.ID).Select("id").First(&types.Schedule{}).Error; err != nil {
+		db := ipc.GetDatabase()
+		if err := db.Where("id = ?", s.ID).Select("id").First(&types.Schedule{}).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
-				if err = ipc.DB.Create(s).Error; err != nil {
+				if err = db.Create(s).Error; err != nil {
 					log.Printf("Unable to create schedule: %v\n", err)
 					return
 				}
@@ -69,18 +76,20 @@ func (ipc *IPC) Schedule(s *types.Schedule) {
 				return
 			}
 		}
+		go ipc.WatchSchedule(s)
+	}
+}
 
-		go func() {
-			select {
-			case <-time.After(time.Duration(s.ExpiresAt-s.CreatedAt) * time.Millisecond):
-				if rs := ipc.DB.Select("id").Where("id = ?", s.ID).Find(&types.Schedule{}).RowsAffected; rs > 0 {
-					if err := ipc.DB.Unscoped().Delete(&s).Error; err != nil {
-						log.Printf("Unable to delete schedule from db: %v\n", err)
-					}
-					ipc.Send <- &Message{"schedule:done", s}
-				}
+func (ipc *IPC) WatchSchedule(s *types.Schedule) {
+	select {
+	case <-time.After(time.Duration(s.ExpiresAt-s.CreatedAt) * time.Millisecond):
+		db := ipc.GetDatabase()
+		if rs := db.Select("id").Where("id = ?", s.ID).Find(&types.Schedule{}).RowsAffected; rs > 0 {
+			if err := db.Unscoped().Delete(&s).Error; err != nil {
+				log.Printf("Unable to delete schedule from db: %v\n", err)
 			}
-		}()
+			ipc.Send <- &Message{"schedule:done", s}
+		}
 	}
 }
 
@@ -91,7 +100,8 @@ func (ipc *IPC) Start() {
 	go ipc.watch(ctx)
 
 	var pendings []*types.Schedule
-	if err := ipc.DB.Where("status = \"Active\"").Find(&pendings).Error; err != nil {
+	db := ipc.GetDatabase()
+	if err := db.Find(&pendings).Error; err != nil {
 		log.Println(err)
 	} else {
 		for _, sch := range pendings {
@@ -99,7 +109,7 @@ func (ipc *IPC) Start() {
 		}
 	}
 
-	ipc.Send <- &Message{Event: "ready"}
+	ipc.Send <- &Message{Event: "schedule:ready"}
 	<-ipc.Done
 	cancel()
 }
@@ -110,6 +120,7 @@ func (ipc *IPC) Close() {
 }
 
 func (ipc *IPC) watch(c context.Context) {
+	db := ipc.GetDatabase()
 	for {
 		select {
 		case data, ok := <-ipc.Message:
@@ -122,12 +133,12 @@ func (ipc *IPC) watch(c context.Context) {
 					}
 				case "schedule:exists":
 					{
-						rs := ipc.DB.Select("id").Where("id = ?", data.Data.(string)).Find(&types.Schedule{}).RowsAffected
+						rs := db.Select("id").Where("id = ?", data.Data.(string)).Find(&types.Schedule{}).RowsAffected
 						ipc.Send <- &Message{"schedule:exists", rs > 0}
 					}
 				case "schedule:delete":
 					{
-						err := ipc.DB.Unscoped().Where("id = ?", data.Data.(string)).Delete(&types.Schedule{}).Error
+						err := db.Unscoped().Where("id = ?", data.Data.(string)).Delete(&types.Schedule{}).Error
 						if err != nil {
 							log.Printf("Unable to delete schedule: %v\n", err)
 							continue
